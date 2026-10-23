@@ -2,7 +2,7 @@
  * Todo ocurre en el navegador: los archivos nunca salen del ordenador. */
 "use strict";
 
-const { ZipReader, ZipWriter, BlobReader, BlobWriter, TextReader, configure } = zip;
+const { ZipReader, ZipWriter, BlobReader, BlobWriter, configure } = zip;
 configure({ useWebWorkers: false });
 
 const MB = 1024 * 1024;
@@ -139,11 +139,149 @@ function plan(entries, budget) {
   return { units, oversize: oversize.sort((a, b) => collator.compare(a.filename, b.filename)) };
 }
 
+/* ---------- Escritura de ZIP sin streams ----------
+ * Los ZIP de salida se montan a mano: cabeceras + los bytes comprimidos originales, tomados con
+ * Blob.slice() directamente del archivo subido. No se descomprime ni se recomprime nada, apenas
+ * usa memoria y funciona igual en cualquier navegador. */
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date) {
+  const d = date instanceof Date && !isNaN(date) ? date : new Date();
+  const year = Math.min(Math.max(d.getFullYear(), 1980), 2107);
+  return {
+    time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+    date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+  };
+}
+
+// Localiza los datos comprimidos de una entrada leyendo su cabecera local.
+async function rawSlice(blob, offset, compressedSize) {
+  const view = new DataView(await blob.slice(offset, offset + 30).arrayBuffer());
+  if (view.getUint32(0, true) !== 0x04034b50) throw new Error("Cabecera ZIP no válida en la posición " + offset);
+  const flags = view.getUint16(6, true);
+  const method = view.getUint16(8, true);
+  const nameLength = view.getUint16(26, true);
+  const extraLength = view.getUint16(28, true);
+  // Solo se conserva el campo extra de cifrado AES; el resto se puede omitir sin problema.
+  let extra = new Uint8Array(0);
+  if (flags & 1 && extraLength) {
+    const raw = new Uint8Array(await blob.slice(offset + 30 + nameLength, offset + 30 + nameLength + extraLength).arrayBuffer());
+    for (let i = 0; i + 4 <= raw.length; ) {
+      const id = raw[i] | (raw[i + 1] << 8);
+      const size = raw[i + 2] | (raw[i + 3] << 8);
+      if (id === 0x9901) extra = raw.slice(i, i + 4 + size);
+      i += 4 + size;
+    }
+  }
+  const start = offset + 30 + nameLength + extraLength;
+  return { blob: blob.slice(start, start + compressedSize), method, flags: flags & 1, extra };
+}
+
+// Convierte una entrada leída por zip.js en un elemento que se puede copiar tal cual.
+function fromEntry(file, entry) {
+  return {
+    filename: entry.filename,
+    directory: entry.directory,
+    lastModDate: entry.lastModDate,
+    signature: entry.signature,
+    compressedSize: entry.compressedSize,
+    uncompressedSize: entry.uncompressedSize,
+    entry,
+    raw: () => rawSlice(file, entry.offset, entry.compressedSize),
+  };
+}
+
+// Elemento sin comprimir (texto o trozo de archivo) con su CRC calculado.
+async function storedItem(filename, blob, lastModDate) {
+  const signature = crc32(new Uint8Array(await blob.arrayBuffer()));
+  return {
+    filename,
+    lastModDate,
+    signature,
+    compressedSize: blob.size,
+    uncompressedSize: blob.size,
+    raw: async () => ({ blob, method: 0, flags: 0, extra: new Uint8Array(0) }),
+  };
+}
+
+async function buildZip(items) {
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+  for (const item of items) {
+    const name = encoder.encode(item.filename);
+    const { blob, method, flags, extra } = item.directory
+      ? { blob: new Blob([]), method: 0, flags: 0, extra: new Uint8Array(0) }
+      : await item.raw();
+    if (blob.size >= 0xffffffff || offset >= 0xffffffff) throw new Error("Archivo de más de 4 GB no soportado");
+    const { time, date } = dosDateTime(item.lastModDate);
+    const version = extra.length ? 51 : 20;
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, version, true);
+    local.setUint16(6, flags | 0x0800, true); // 0x0800 = nombres en UTF-8
+    local.setUint16(8, method, true);
+    local.setUint16(10, time, true);
+    local.setUint16(12, date, true);
+    local.setUint32(14, item.directory ? 0 : item.signature, true);
+    local.setUint32(18, blob.size, true);
+    local.setUint32(22, item.directory ? 0 : item.uncompressedSize, true);
+    local.setUint16(26, name.length, true);
+    local.setUint16(28, extra.length, true);
+    chunks.push(local, name, extra, blob);
+
+    const header = new DataView(new ArrayBuffer(46));
+    header.setUint32(0, 0x02014b50, true);
+    header.setUint16(4, version, true);
+    for (let i = 6; i < 32; i++) header.setUint8(i, local.getUint8(i - 2));
+    header.setUint32(38, item.directory ? 0x10 : 0, true);
+    header.setUint32(42, offset, true);
+    central.push(header, name, extra);
+    offset += 30 + name.length + extra.length + blob.size;
+  }
+  const centralSize = central.reduce((n, part) => n + part.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, items.length, true);
+  end.setUint16(10, items.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+  return new Blob([...chunks, ...central, end], { type: "application/zip" });
+}
+
+// Construye un grupo y, si por lo que sea se pasara del límite, lo divide en dos.
+async function buildGroup(items, limit, onDone) {
+  const blob = await buildZip(items);
+  if (blob.size <= limit || items.length === 1) {
+    onDone(items);
+    return [blob];
+  }
+  const half = Math.ceil(items.length / 2);
+  return [
+    ...(await buildGroup(items.slice(0, half), limit, onDone)),
+    ...(await buildGroup(items.slice(half), limit, onDone)),
+  ];
+}
+
 /* ---------- Archivos más grandes que el límite ---------- */
 
-/* Destino que va guardando los datos en bloques de 8 MB. Evita crear de golpe un único Blob
- * enorme a partir de un stream, que en algunos navegadores (sobre todo móviles) falla con
- * "Cannot close a ERRORED writable stream". */
+/* Destino que va guardando los datos en bloques de 8 MB, para no crear de golpe un único Blob
+ * enorme a partir de un stream (en algunos navegadores eso falla). */
 function chunkedSink() {
   const blobs = [];
   let buffer = [];
@@ -165,35 +303,42 @@ function chunkedSink() {
   return { stream, blob: () => new Blob(blobs) };
 }
 
+// Si la descompresión se queda bloqueada, se abandona para pasar al siguiente método.
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("La descompresión no avanza")), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function decompress(entry, options) {
   const sink = chunkedSink();
-  await entry.getData(sink.stream, options);
-  return sink.blob();
+  await withTimeout(entry.getData(sink.stream, options), 60000 + entry.uncompressedSize / 1000);
+  const blob = sink.blob();
+  if (blob.size !== entry.uncompressedSize) throw new Error("Tamaño descomprimido incorrecto");
+  return blob;
 }
 
-// Un ZIP con solo esta entrada, copiada tal cual (sin descomprimir).
-async function rawZip(entry) {
-  const sink = chunkedSink();
-  const writer = new ZipWriter(sink.stream);
-  await copyEntry(writer, entry);
-  await writer.close();
-  return sink.blob();
+// Comprime un trozo con zip.js y devuelve sus datos comprimidos listos para copiar.
+async function compressedItem(filename, blob, lastModDate) {
+  const writer = new ZipWriter(new BlobWriter(), { level: 6 });
+  await writer.add("x", new BlobReader(blob), { lastModDate });
+  const zipBlob = await writer.close();
+  const [entry] = await new ZipReader(new BlobReader(zipBlob)).getEntries();
+  return { ...fromEntry(zipBlob, entry), filename, lastModDate, directory: false };
 }
 
-// Comprime un trozo; si la compresión nativa del navegador falla, usa la de zip.js.
-async function compressPiece(blob, level, lastModDate) {
-  const attempt = async (options) => {
-    const writer = new ZipWriter(new BlobWriter(), { level, ...options });
-    await writer.add("x", new BlobReader(blob), { lastModDate });
-    const [entry] = await new ZipReader(new BlobReader(await writer.close())).getEntries();
-    return entry;
-  };
-  try {
-    return await attempt({});
-  } catch (err) {
-    console.warn(err);
-    return attempt({ useCompressionStream: false });
+async function pieceItem(filename, blob, compress, lastModDate) {
+  if (compress) {
+    try {
+      const item = await compressedItem(filename, blob, lastModDate);
+      if (item.compressedSize < blob.size) return item;
+    } catch (err) {
+      console.warn(err);
+    }
   }
+  return storedItem(filename, blob, lastModDate);
 }
 
 function joinInstructions(filename, joined, count, wrapped) {
@@ -215,108 +360,72 @@ function joinInstructions(filename, joined, count, wrapped) {
   ].join("\r\n");
 }
 
-/* Trocea un archivo enorme en piezas "nombre.001", "nombre.002"... Cada pieza se comprime una
- * sola vez y se convierte en un bloque más, así los trozos pequeños comparten parte con otros
- * archivos en lugar de ocupar un ZIP casi vacío. */
-async function splitFile(entry, budget, log) {
-  log(`Troceando ${entry.filename} (${formatSize(entry.uncompressedSize)})…`);
-  // Si el navegador no logra descomprimirlo, se trocea el archivo comprimido tal cual
-  // (metido en un .zip) para que nunca se quede fuera.
-  let data;
-  let joined = entry.filename;
+/* Trocea un archivo enorme en piezas "nombre.001", "nombre.002"... Cada pieza se convierte en un
+ * bloque más, así los trozos pequeños comparten parte con otros archivos en lugar de ocupar un
+ * ZIP casi vacío. */
+async function splitFile(item, budget, log, progress) {
+  log(`Troceando ${item.filename} (${formatSize(item.uncompressedSize)})…`);
+  const ext = item.filename.split(".").pop().toLowerCase();
+  let compress = !COMPRESSED_EXT.has(ext);
+  let joined = item.filename;
   let wrapped = false;
-  try {
-    data = await decompress(entry);
-  } catch (err) {
-    console.warn(err);
+  let data;
+  if (item.entry.compressionMethod === 0) {
+    data = (await item.raw()).blob; // guardado sin comprimir: se usa tal cual
+  } else {
     try {
-      data = await decompress(entry, { useCompressionStream: false });
-    } catch (err2) {
-      console.warn(err2);
-      log(`No se pudo descomprimir ${entry.filename}; se trocea comprimido (${err2.message || err2}).`);
-      data = await rawZip(entry);
-      joined = entry.filename + ".zip";
-      wrapped = true;
+      data = await decompress(item.entry);
+    } catch (err) {
+      console.warn(err);
+      try {
+        data = await decompress(item.entry, { useCompressionStream: false });
+      } catch (err2) {
+        console.warn(err2);
+        // Último recurso: se trocea el archivo comprimido tal cual, metido en un .zip.
+        log(`No se pudo descomprimir ${item.filename} en este navegador; se trocea comprimido.`);
+        data = await buildZip([item]);
+        joined = item.filename + ".zip";
+        wrapped = true;
+        compress = false;
+      }
     }
   }
-  const ext = entry.filename.split(".").pop().toLowerCase();
-  const level = wrapped || COMPRESSED_EXT.has(ext) ? 0 : 6;
-  const ratio = level ? Math.max(entry.compressedSize / Math.max(entry.uncompressedSize, 1), 0.05) : 1;
+  const ratio = compress ? Math.max(item.compressedSize / Math.max(item.uncompressedSize, 1), 0.05) : 1;
   const overhead = entryOverhead(joined + ".000");
   const room = budget - README_RESERVE - overhead;
-  const step = Math.max(64 * 1024, Math.floor((room / ratio) * 0.92));
+  const step = Math.max(64 * 1024, Math.floor(Math.min(room / ratio, room * 20) * 0.92));
 
   const ranges = [];
   for (let start = 0; start < data.size; start += step) ranges.push([start, Math.min(start + step, data.size)]);
 
-  // Comprime cada trozo y, si alguno no cabe, lo parte por la mitad hasta que quepa.
+  // Si algún trozo comprimido no cabe, se parte por la mitad hasta que quepa.
   const pieces = [];
   while (ranges.length) {
     const [start, end] = ranges.shift();
-    const compressed = await compressPiece(data.slice(start, end), level, entry.lastModDate);
-    if (compressed.compressedSize + overhead + README_RESERVE > budget && end - start > 1024) {
+    const piece = await pieceItem("", data.slice(start, end), compress, item.lastModDate);
+    if (piece.compressedSize + overhead + README_RESERVE > budget && end - start > 1024) {
       const mid = start + Math.floor((end - start) / 2);
       ranges.unshift([start, mid], [mid, end]);
     } else {
-      pieces.push(compressed);
+      pieces.push(piece);
+      progress(`Troceando ${item.filename.split("/").pop()}: ${formatSize(end)} de ${formatSize(data.size)}`, end / data.size);
     }
   }
 
-  const dir = entry.filename.slice(0, entry.filename.lastIndexOf("/") + 1);
-  const readmeName = `${dir}COMO_UNIR_${entry.filename.split("/").pop()}.txt`;
-  const readme = joinInstructions(entry.filename, joined, pieces.length, wrapped);
-  return pieces.map((src, i) => {
-    const filename = `${joined}.${String(i + 1).padStart(3, "0")}`;
-    const items = [{ filename, src, lastModDate: entry.lastModDate }];
-    if (i === 0) items.push({ filename: readmeName, text: readme });
-    const size = src.compressedSize + overhead + (i === 0 ? README_RESERVE : 0);
+  const dir = item.filename.slice(0, item.filename.lastIndexOf("/") + 1);
+  const readmeName = `${dir}COMO_UNIR_${item.filename.split("/").pop()}.txt`;
+  const readme = await storedItem(
+    readmeName,
+    new Blob([encoder.encode(joinInstructions(item.filename, joined, pieces.length, wrapped))]),
+    new Date(),
+  );
+  return pieces.map((piece, i) => {
+    piece.filename = `${joined}.${String(i + 1).padStart(3, "0")}`;
+    piece.piece = true;
+    const items = i === 0 ? [piece, readme] : [piece];
+    const size = piece.compressedSize + overhead + (i === 0 ? README_RESERVE : 0);
     return { entries: items, size };
   });
-}
-
-/* ---------- Escritura de los ZIP ---------- */
-
-// Copia una entrada sin descomprimirla ni recomprimirla: rápido y sin pérdida.
-async function copyEntry(writer, item) {
-  const src = item.src || item;
-  const sink = chunkedSink();
-  await src.getData(sink.stream, { passThrough: true });
-  await writer.add(item.filename, new BlobReader(sink.blob()), {
-    passThrough: true,
-    encrypted: src.encrypted,
-    uncompressedSize: src.uncompressedSize,
-    signature: src.signature,
-    compressionMethod: src.compressionMethod,
-    lastModDate: item.lastModDate,
-  });
-}
-
-async function writeGroup(items) {
-  const writer = new ZipWriter(new BlobWriter("application/zip"), { keepOrder: true });
-  for (const item of items) {
-    if (item.text !== undefined) {
-      await writer.add(item.filename, new TextReader(item.text));
-    } else if (item.directory) {
-      await writer.add(item.filename, null, { directory: true, lastModDate: item.lastModDate });
-    } else {
-      await copyEntry(writer, item);
-    }
-  }
-  return writer.close();
-}
-
-// Construye un grupo y, si por lo que sea se pasara del límite, lo divide en dos.
-async function buildGroup(items, limit, onDone) {
-  const blob = await writeGroup(items);
-  if (blob.size <= limit || items.length === 1) {
-    onDone(items);
-    return [blob];
-  }
-  const half = Math.ceil(items.length / 2);
-  return [
-    ...(await buildGroup(items.slice(0, half), limit, onDone)),
-    ...(await buildGroup(items.slice(half), limit, onDone)),
-  ];
 }
 
 /* ---------- Interfaz ---------- */
@@ -391,13 +500,14 @@ async function processFile(file, limit) {
   results.prepend(card);
 
   const reader = new ZipReader(new BlobReader(file));
-  const entries = await reader.getEntries();
+  const entries = (await reader.getEntries()).map((entry) => fromEntry(file, entry));
   const fileEntries = entries.filter((e) => !e.directory);
   log(`${file.name}: ${fileEntries.length} archivos, ${formatSize(file.size)}.`);
 
   const budget = limit - ZIP_TAIL;
   const { units, oversize } = plan(entries, budget);
-  for (const entry of oversize) units.push(...(await splitFile(entry, budget, log)));
+  const progress = (label, fraction) => setProgress(fraction, 1, label);
+  for (const entry of oversize) units.push(...(await splitFile(entry, budget, log, progress)));
   const bins = packUnits(units, budget);
 
   const expected = bins.flatMap((bin) => bin.entries).filter((e) => !e.directory);
@@ -425,7 +535,7 @@ async function processFile(file, limit) {
   // Comprobación final: cada archivo del ZIP original (o cada trozo suyo) está en alguna parte.
   const originalsDone = new Set(fileEntries.map((e) => e.filename).filter((name) => written.has(name)));
   for (const e of oversize) {
-    const pieces = expected.filter((x) => x.src && x.filename.startsWith(e.filename + "."));
+    const pieces = expected.filter((x) => x.piece && x.filename.startsWith(e.filename + "."));
     if (pieces.every((x) => written.has(x.filename))) originalsDone.add(e.filename);
   }
   const splitCount = oversize.length;
@@ -452,6 +562,19 @@ async function processFile(file, limit) {
   log(`${file.name}: listo, ${total} parte(s).`, missing.length ? "bad" : "ok");
 }
 
+function errorText(err) {
+  if (err instanceof Error) return `${err.name}: ${err.message}`;
+  try {
+    return String(err ?? "error desconocido");
+  } catch (_) {
+    return "error desconocido";
+  }
+}
+
+// Cualquier error que se escape también se muestra, para que nunca falle en silencio.
+window.addEventListener("unhandledrejection", (e) => log(`Error inesperado — ${errorText(e.reason)}`, "bad"));
+window.addEventListener("error", (e) => log(`Error inesperado — ${errorText(e.error || e.message)}`, "bad"));
+
 async function handleFiles(files) {
   if (busy) return;
   const zips = [...files].filter((f) => /\.zip$/i.test(f.name));
@@ -473,8 +596,9 @@ async function handleFiles(files) {
         await processFile(file, limit);
       } catch (err) {
         console.error(err);
-        log(`${file.name}: error — ${err.message || err}`, "bad");
-        if (err.name === "NotReadableError" || /ERRORED|read/i.test(err.message || "")) {
+        const message = errorText(err);
+        log(`${file.name}: error — ${message}`, "bad");
+        if (/NotReadable|ERRORED|read/i.test(message)) {
           log("Consejo: si el ZIP está en una nube (Drive, OneDrive, iCloud…) o en el móvil, cópialo primero " +
             "a una carpeta normal del ordenador y vuelve a intentarlo, mejor en Chrome o Edge.", "bad");
         }

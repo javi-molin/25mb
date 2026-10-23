@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Divisor de ZIP</title>
+  <meta name="description" content="Divide ZIP grandes en partes de como máximo 25 MB sin dejar ningún archivo fuera.">
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6677; --border: #dde1e8;
+      --accent: #2f6fed; --accent-soft: #e8efff; --ok: #1f8a4c; --bad: #c4352b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12151b; --card: #1b1f27; --text: #e6e9ef; --muted: #9aa3b4; --border: #2c3240;
+        --accent: #6c9bff; --accent-soft: #1e2a44; --ok: #4cc27f; --bad: #ff7b70;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+    h1 { font-size: 1.8rem; margin: 0 0 4px; }
+    .lead { color: var(--muted); margin: 0 0 24px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+    .options { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; }
+    .options label { display: flex; align-items: center; gap: 8px; }
+    .options input[type=number] {
+      width: 90px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px;
+      background: var(--bg); color: var(--text); font: inherit;
+    }
+    #folder-name { color: var(--muted); font-size: .9rem; }
+    #dropzone {
+      border: 2px dashed var(--border); border-radius: 12px; padding: 48px 16px; text-align: center;
+      cursor: pointer; transition: border-color .15s, background .15s;
+    }
+    #dropzone:hover, #dropzone.over, #dropzone:focus-visible { border-color: var(--accent); background: var(--accent-soft); outline: none; }
+    #dropzone.busy { opacity: .6; cursor: progress; }
+    #dropzone strong { display: block; font-size: 1.15rem; margin-bottom: 4px; }
+    #dropzone span { color: var(--muted); }
+    .btn {
+      display: inline-block; border: 0; border-radius: 8px; padding: 8px 14px; font: inherit; font-weight: 600;
+      background: var(--accent); color: #fff; cursor: pointer; text-decoration: none; margin-bottom: 12px;
+    }
+    .btn.secondary { background: var(--accent-soft); color: var(--accent); margin: 0; }
+    .btn.small { padding: 4px 10px; font-size: .9rem; margin: 0; }
+    #progress { margin-top: 16px; }
+    .bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+    #progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+    #progress-text { font-size: .9rem; color: var(--muted); margin-top: 6px; }
+    .result h3 { margin: 0 0 4px; word-break: break-all; }
+    .summary { color: var(--ok); margin: 0 0 12px; font-weight: 600; }
+    .summary.bad { color: var(--bad); }
+    .parts { list-style: none; margin: 0; padding: 0; }
+    .part { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--border); }
+    .part-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .part-size { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .part-saved { color: var(--ok); font-weight: 600; }
+    #log { font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; max-height: 180px; overflow: auto; color: var(--muted); }
+    .log-line.ok { color: var(--ok); }
+    .log-line.bad { color: var(--bad); }
+    details summary { cursor: pointer; font-weight: 600; }
+    details ul { color: var(--muted); padding-left: 20px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Divisor de ZIP</h1>
+  <p class="lead">Sube un ZIP grande y te lo devuelvo en varios ZIP con el mismo nombre numerado
+    (<code>nombre_1.zip</code>, <code>nombre_2.zip</code>…), cada uno por debajo del límite.
+    Todo se hace en tu navegador: tus archivos no se suben a ningún servidor.</p>
+
+  <section class="card options">
+    <label>Tamaño máximo por parte
+      <input id="limit" type="number" min="1" step="0.5" value="25"> MB
+    </label>
+    <button id="pick-folder" class="btn secondary" type="button">Guardar directamente en una carpeta…</button>
+    <span id="folder-name"></span>
+  </section>
+
+  <section class="card">
+    <div id="dropzone" role="button" tabindex="0">
+      <strong>Arrastra aquí tus ZIP o haz clic para elegirlos</strong>
+      <span>Puedes elegir varios a la vez</span>
+    </div>
+    <input id="file-input" type="file" accept=".zip,application/zip" multiple hidden>
+    <div id="progress" hidden>
+      <div class="bar"><div id="progress-bar"></div></div>
+      <div id="progress-text"></div>
+    </div>
+  </section>
+
+  <div id="results"></div>
+
+  <section class="card">
+    <div id="log"></div>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>¿Cómo se reparten los archivos?</summary>
+      <ul>
+        <li>Se respeta la estructura de carpetas original dentro de cada parte.</li>
+        <li>Si una carpeta (por ejemplo, un chat con sus fotos y audios) cabe entera en una parte, nunca se separa.</li>
+        <li>Si una carpeta es más grande que el límite, se corta en tramos seguidos por orden de nombre.</li>
+        <li>Los bloques se combinan para usar el menor número de partes posible.</li>
+        <li>Los archivos se copian tal cual, sin recomprimir: no se pierde calidad y es rápido.</li>
+        <li>Si un solo archivo pesa más que el límite, se trocea (<code>.001</code>, <code>.002</code>…) e incluye un
+          <code>COMO_UNIR_….txt</code> con las instrucciones para volver a unirlo.</li>
+        <li>Al terminar se comprueba que todos los archivos del ZIP original están en alguna parte.</li>
+      </ul>
+    </details>
+  </section>
+</main>
+<script src="lib/zip-full.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -16,10 +16,12 @@ partes. En Chrome/Edge puedes elegir una carpeta para que las partes se guarden 
 - Una carpeta que cabe entera en una parte (p. ej. un chat con sus fotos y audios) no se separa nunca.
 - Una carpeta mayor que el límite se corta en tramos consecutivos por orden de nombre.
 - Los bloques se combinan (first-fit decreasing) para generar el menor número de partes posible.
-- Los archivos se copian sin recomprimir, así que el tamaño de cada parte se conoce de antemano y no se
-  pierde calidad. Cada parte se comprueba al terminar y, si superase el límite, se vuelve a dividir.
+- Los archivos se copian sin recomprimir: los ZIP de salida se montan con los bytes comprimidos originales
+  (`Blob.slice`), sin streams, así que funciona en cualquier navegador, apenas usa memoria y el tamaño de
+  cada parte se conoce de antemano. Si una parte superase el límite, se vuelve a dividir.
 - Un archivo que por sí solo supera el límite se trocea en `archivo.001`, `archivo.002`, … y se incluye un
-  `COMO_UNIR_archivo.txt` con los comandos para unirlo de nuevo en Windows y Mac/Linux.
+  `COMO_UNIR_archivo.txt` con los comandos para unirlo de nuevo en Windows y Mac/Linux. Si el navegador no
+  consigue descomprimirlo, se trocea comprimido (`archivo.zip.001`…) para que nunca se quede fuera.
 - Al final se verifica que todos los archivos del ZIP original aparecen en alguna parte.
 
 ## Publicarla con GitHub Pages
